@@ -209,7 +209,7 @@ static void thread_func(void *userdata) {
         /* Sleep */
 #if (PULSEAUDIO_VERSION == 5)
         if ((ret = pa_rtpoll_run(u->rtpoll, true)) < 0)
-#elif (PULSEAUDIO_VERSION == 6)
+#elif (PULSEAUDIO_VERSION >= 6)
         if ((ret = pa_rtpoll_run(u->rtpoll)) < 0)
 #endif
             goto fail;
@@ -236,12 +236,21 @@ static int suspend(struct userdata *u) {
     pa_assert(u);
     pa_assert(u->stream);
 
-    ret = u->stream->in->common.standby(&u->stream->in->common);
+    ret = pa_droid_stream_suspend(u->stream, true);
 
     if (ret == 0)
         pa_log_info("Device suspended.");
 
     return ret;
+}
+
+/* Called from IO context */
+static void unsuspend(struct userdata *u) {
+    pa_assert(u);
+    pa_assert(u->stream);
+
+    pa_droid_stream_suspend(u->stream, false);
+    pa_log_info("Resuming...");
 }
 
 /* Called from IO context */
@@ -265,7 +274,7 @@ static int source_process_msg(pa_msgobject *o, int code, void *data, int64_t off
                 case PA_SOURCE_IDLE:
                     break;
                 case PA_SOURCE_RUNNING: {
-                    pa_log_info("Resuming...");
+                    unsuspend(u);
                     u->timestamp = pa_rtclock_now();
                     break;
                 }
@@ -359,7 +368,7 @@ static void source_set_name(pa_modargs *ma, pa_source_new_data *data, const char
 
 #if (PULSEAUDIO_VERSION == 5)
 static void source_get_mute_cb(pa_source *s) {
-#elif (PULSEAUDIO_VERSION == 6)
+#elif (PULSEAUDIO_VERSION >= 6)
 static int source_get_mute_cb(pa_source *s, bool *muted) {
 #endif
     struct userdata *u = s->userdata;
@@ -379,7 +388,7 @@ static int source_get_mute_cb(pa_source *s, bool *muted) {
 #if (PULSEAUDIO_VERSION == 5)
     if (ret == 0)
         s->muted = b;
-#elif (PULSEAUDIO_VERSION == 6)
+#elif (PULSEAUDIO_VERSION >= 6)
     if (ret == 0)
         *muted = b;
 

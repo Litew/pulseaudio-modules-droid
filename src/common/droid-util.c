@@ -55,6 +55,7 @@
 #include <pulsecore/shared.h>
 #include <pulsecore/mutex.h>
 #include <pulsecore/strlist.h>
+#include <pulsecore/atomic.h>
 
 #include "droid-util.h"
 
@@ -861,8 +862,13 @@ static pa_droid_profile *add_combined_profile(pa_droid_profile_set *ps,
     }
     to_inputs = pa_strlist_reverse(to_inputs);
 
+#if (PULSEAUDIO_VERSION >= 8)
+    o_str = pa_strlist_to_string(to_outputs);
+    i_str = pa_strlist_to_string(to_inputs);
+#else
     o_str = pa_strlist_tostring(to_outputs);
     i_str = pa_strlist_tostring(to_inputs);
+#endif
 
     pa_log_debug("New combined profile: %s (outputs: %s, inputs: %s)", module->name, o_str, i_str);
 
@@ -1142,9 +1148,7 @@ static void add_i_ports(pa_droid_mapping *am) {
         if (devices & cur_device) {
 
 #if DROID_HAL >= 2
-#ifndef DROID_DEVICE_MAKO
             cur_device |= AUDIO_DEVICE_BIT_IN;
-#endif
 #endif
 
             pa_assert_se(pa_droid_input_port_name(cur_device, &name));
@@ -1530,7 +1534,7 @@ static pa_droid_stream *droid_stream_new(pa_droid_hw_module *module) {
     s = pa_xnew0(pa_droid_stream, 1);
     PA_REFCNT_INIT(s);
 
-    s->module = module;
+    s->module = pa_droid_hw_module_ref(module);
 
     return s;
 }
@@ -1665,8 +1669,12 @@ pa_droid_stream *pa_droid_open_input_stream(pa_droid_hw_module *module,
         pa_channel_map_init_mono(&channel_map);
         sample_spec.channels = 1;
         /* Only allow recording both downlink and uplink. */
-#ifdef QCOM_HARDWARE
+#if defined(QCOM_HARDWARE)
+  #if ANDROID_VERSION_MAJOR == 5 && ANDROID_VERSION_MINOR == 1
+        hal_channel_mask = AUDIO_CHANNEL_IN_MONO;
+  #else
         hal_channel_mask = AUDIO_CHANNEL_IN_VOICE_CALL_MONO;
+  #endif
 #else
         hal_channel_mask = AUDIO_CHANNEL_IN_VOICE_UPLINK | AUDIO_CHANNEL_IN_VOICE_DNLINK;
 #endif
@@ -1691,7 +1699,15 @@ pa_droid_stream *pa_droid_open_input_stream(pa_droid_hw_module *module,
     pa_droid_hw_module_unlock(module);
 
     if (ret < 0 || !stream) {
-        pa_log("Failed to open input stream: %d", ret);
+        pa_log("Failed to open input stream: %d with device: %u flags: %u sample rate: %u channels: %u (%u) format: %u (%u)",
+               ret,
+               devices,
+               0, /* AUDIO_INPUT_FLAG_NONE on v3. v1 and v2 don't have input flags. */
+               config_in.sample_rate,
+               sample_spec.channels,
+               config_in.channel_mask,
+               sample_spec.format,
+               config_in.format);
         goto fail;
     }
 
@@ -1707,6 +1723,10 @@ pa_droid_stream *pa_droid_open_input_stream(pa_droid_hw_module *module,
     pa_idxset_put(module->inputs, s, NULL);
 
     buffer_size = s->in->common.get_buffer_size(&s->in->common);
+
+    /* As audio_source_t may not have any effect when opening the input stream
+     * set input parameters immediately after opening the stream. */
+    pa_droid_stream_set_input_route(s, devices, NULL);
 
     pa_log_info("Opened droid input stream %p with device: %u flags: %u sample rate: %u channels: %u (%u) format: %u (%u) buffer size: %u (%llu usec)",
             (void *) s,
@@ -1754,6 +1774,8 @@ void pa_droid_stream_unref(pa_droid_stream *s) {
         s->module->device->close_input_stream(s->module->device, s->in);
         pa_mutex_unlock(s->module->input_mutex);
     }
+
+    pa_droid_hw_module_unref(s->module);
 
     pa_xfree(s);
 }
@@ -1852,12 +1874,12 @@ int pa_droid_stream_set_input_route(pa_droid_stream *s, audio_devices_t device, 
                  (void *) s, parameters, device, source);
 
 
-#if defined(DROID_DEVICE_MAKO) || defined(DROID_DEVICE_ANZU) ||\
+#if defined(DROID_DEVICE_ANZU) ||\
     defined(DROID_DEVICE_COCONUT) || defined(DROID_DEVICE_HAIDA) ||\
     defined(DROID_DEVICE_HALLON) || defined(DROID_DEVICE_IYOKAN) ||\
     defined(DROID_DEVICE_MANGO) || defined(DROID_DEVICE_SATSUMA) ||\
     defined(DROID_DEVICE_SMULTRON) || defined(DROID_DEVICE_URUSHI)
-#warning Using mako set_parameters hack.
+#warning Using set_parameters hack, originating from previous cm10 mako.
     pa_mutex_lock(s->module->hw_mutex);
     ret = s->module->device->set_parameters(s->module->device, parameters);
     pa_mutex_unlock(s->module->hw_mutex);
@@ -1923,4 +1945,49 @@ int pa_droid_set_parameters(pa_droid_hw_module *hw, const char *parameters) {
         pa_log("hw module %p set_parameters(%s) failed: %d", (void *) hw, parameters, ret);
 
     return ret;
+}
+
+bool pa_droid_stream_is_primary(pa_droid_stream *s) {
+    pa_assert(s);
+    pa_assert(s->out || s->in);
+
+    /* Even though earlier (< 3) HALs don't have input flags,
+     * input flags don't have anything similar as output stream's
+     * primary flag and we can just always reply false for
+     * input streams. */
+    if (s->out)
+        return s->flags & AUDIO_OUTPUT_FLAG_PRIMARY;
+    else
+        return false;
+}
+
+int pa_droid_stream_suspend(pa_droid_stream *s, bool suspend) {
+    pa_assert(s);
+    pa_assert(s->out || s->in);
+
+    if (s->out) {
+        if (suspend) {
+            pa_atomic_dec(&s->module->active_outputs);
+            return s->out->common.standby(&s->out->common);
+        } else {
+            pa_atomic_inc(&s->module->active_outputs);
+            return 0;
+        }
+    } else {
+        if (suspend)
+            return s->in->common.standby(&s->in->common);
+        else
+            return 0;
+    }
+}
+
+bool pa_sink_is_droid_sink(pa_sink *s) {
+    const char *api;
+
+    pa_assert(s);
+
+    if ((api = pa_proplist_gets(s->proplist, PA_PROP_DEVICE_API)))
+        return pa_streq(api, PROP_DROID_API_STRING);
+    else
+        return false;
 }
